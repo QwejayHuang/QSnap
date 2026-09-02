@@ -1,0 +1,195 @@
+name: Build and Release QSnap
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动构建版本号 (例如: 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka ordered-set zstandard
+
+      - name: Resolve Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            ORIGINAL_VER="${{ github.ref_name }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ORIGINAL_VER="${{ github.event.inputs.version }}"
+          else
+            ORIGINAL_VER="1.0.0-dev"
+          fi
+          
+          CLEAN_VER=$(echo "$ORIGINAL_VER" | sed -E 's/^[vV]//g')
+          
+          METADATA_VER=$(echo "$CLEAN_VER" | cut -d'-' -f1)
+          if [[ ! "$METADATA_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            METADATA_VER="1.0.0"
+          fi
+          
+          echo "clean_version=$CLEAN_VER" >> $GITHUB_OUTPUT
+          echo "metadata_version=$METADATA_VER" >> $GITHUB_OUTPUT
+
+      - name: Sync Version to Code
+        shell: python
+        run: |
+          import re
+          import os
+
+          version = "${{ steps.version.outputs.clean_version }}"
+          print(f"Target version to sync: {version}")
+
+          for filename in ["main.py", "qsnap.py", "QSnap.py"]:
+              if os.path.exists(filename):
+                  with open(filename, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  
+                  if "__version__" in content:
+                      content = re.sub(
+                          r'(__version__\s*=\s*["\'])[^"\']+(["\'])',
+                          f'\\g<1>{version}\\g<2>',
+                          content,
+                          count=1
+                      )
+                  content = re.sub(
+                      r'QSnap\s+[0-9]+\.[0-9]+(\.[0-9]+)?',
+                      f'QSnap {version}',
+                      content
+                  )
+                  with open(filename, 'w', encoding='utf-8') as f:
+                      f.write(content)
+                  print(f"Successfully synchronized version in {filename}.")
+
+      - name: Build with Nuitka
+        run: |
+          $version = "${{ steps.version.outputs.clean_version }}"
+          $metadataVersion = "${{ steps.version.outputs.metadata_version }}"
+          
+          if (Test-Path "main.py") {
+              $entryPoint = "main.py"
+              $expectedExe = "dist/main.exe"
+          } elseif (Test-Path "QSnap.py") {
+              $entryPoint = "QSnap.py"
+              $expectedExe = "dist/QSnap.exe"
+          } else {
+              Write-Error "未找到入口 Python 文件 (main.py 或 QSnap.py)"
+              exit 1
+          }
+          
+          $nuitkaParams = @(
+            "-m", "nuitka",
+            "--standalone",
+            "--onefile",
+            "--windows-console-mode=disable",
+            "--enable-plugin=pyside6",
+            "--product-name=QSnap",
+            "--product-version=$metadataVersion",
+            "--file-description=QSnap Screenshot Suite with OCR",
+            "--output-dir=dist",
+            "--clean-cache=all",
+            "--remove-output",
+            "--noinclude-unittest-mode=nofollow",
+            "--noinclude-pytest-mode=nofollow",
+            "--noinclude-setuptools-mode=nofollow",
+            "--assume-yes-for-downloads"
+          )
+          
+          $pipList = pip list
+          if ($pipList -match "rapidocr_onnxruntime") {
+              $nuitkaParams += "--include-package=rapidocr_onnxruntime"
+              $nuitkaParams += "--include-package-data=rapidocr_onnxruntime"
+          }
+          
+          if (Test-Path "icon.ico") {
+            $nuitkaParams += "--windows-icon-from-ico=icon.ico"
+            $nuitkaParams += "--include-data-files=icon.ico=icon.ico"
+          }
+          
+          $nuitkaParams += $entryPoint
+          
+          Write-Host "开始执行 Nuitka 编译..."
+          python @nuitkaParams
+          
+          if (Test-Path $expectedExe) {
+            $finalExeName = "QSnap_v$version.exe"
+            Rename-Item -Path $expectedExe -NewName $finalExeName
+            Write-Host "成功生成单文件程序：dist/$finalExeName"
+            
+            Compress-Archive -Path "dist/$finalExeName" -DestinationPath "dist/QSnap_v$($version)_Windows_x64.zip"
+            Write-Host "成功生成发布包：dist/QSnap_v$($version)_Windows_x64.zip"
+          } else {
+            Write-Error "编译失败：未能在 dist 目录下找到生成的 $expectedExe 文件"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSnap-Windows-x64
+          path: |
+            dist/QSnap_v*.exe
+            dist/QSnap_v*.zip
+          retention-days: 7
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          $latestCommit = git log -1 --pretty=format:"- %s (%h)"
+          "changelog<<EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $latestCommit | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Create Release and Upload Assets
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.clean_version) }}
+          name: QSnap v${{ steps.version.outputs.clean_version }}
+          body: |
+            ## 🚀 What's Changed
+            
+            ${{ steps.changelog.outputs.changelog }}
+            
+            ---
+            ### 📦 资产下载与说明
+            - **`QSnap_v${{ steps.version.outputs.clean_version }}_Windows_x64.zip`**: 便携绿色压缩包（解压即用）。
+            - **`QSnap_v${{ steps.version.outputs.clean_version }}.exe`**: Windows 64位 独立单文件版（内置 RapidOCR 离线模型与 PySide6 图形环境）。
+            
+            *此版本由 GitHub Actions 自动化编译构建。*
+          draft: false
+          prerelease: false
+          files: |
+            dist/QSnap_v*.exe
+            dist/QSnap_v*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
