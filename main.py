@@ -1,4 +1,11 @@
+
 from __future__ import annotations
+
+__app_name__ = "QSnap"
+__version__ = "1.1.0"
+__author__ = "QwejayHuang"
+__company__ = "Qwesoft"
+__description__ = "Modern Cross-Platform Python Snipping Tool Powered by RapidOCR"
 
 import ctypes
 import json
@@ -7,7 +14,6 @@ import math
 import os
 import struct
 import sys
-import tempfile
 import time
 import wave
 from ctypes import wintypes
@@ -39,14 +45,11 @@ from PySide6.QtCore import (
     QPointF,
     QRect,
     QRectF,
-    QSize,
     Qt,
     QThread,
-    QTimer,
     Signal,
 )
 from PySide6.QtGui import (
-    QAction,
     QBrush,
     QColor,
     QCursor,
@@ -74,19 +77,38 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QKeySequenceEdit,
+    QScrollArea,
 )
 
-logger = logging.getLogger("QSnap")
+logger = logging.getLogger(__app_name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-_CONFIG_DIR = Path.home() / ".qsnap"
-_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-_CONFIG_FILE = _CONFIG_DIR / "config.json"
+_APP_DIR = Path(sys.argv[0]).parent if getattr(sys.argv, 'frozen', False) else Path(__file__).parent
+_PORTABLE_CONFIG = _APP_DIR / "config.json"
+
+if _PORTABLE_CONFIG.exists():
+    _CONFIG_DIR = _APP_DIR
+    _CONFIG_FILE = _PORTABLE_CONFIG
+    logger.info("Running in Portable Mode.")
+else:
+    _CONFIG_DIR = Path.home() / f".{__app_name__.lower()}"
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _CONFIG_FILE = _CONFIG_DIR / "config.json"
+
+_GLOBAL_OCR_ENGINE = None
+def get_ocr_engine():
+    global _GLOBAL_OCR_ENGINE
+    if _GLOBAL_OCR_ENGINE is None and HAS_OCR:
+        _GLOBAL_OCR_ENGINE = RapidOCR()
+    return _GLOBAL_OCR_ENGINE
+
 
 MATERIAL_ICONS = {
     "rect": "M3 3h18v18H3V3zm16 16V5H5v14h14z",
@@ -125,15 +147,45 @@ def get_svg_icon(name: str, color: str = "#475569", size: int = 24) -> QIcon:
     painter.end()
     return QIcon(pixmap)
 
+def get_logo_icon(size: int = 24) -> QIcon:
+    """渲染具有大厂风格的现代渐变专属 Logo"""
+    svg_str = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+        <defs>
+            <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#3b82f6" />
+                <stop offset="100%" stop-color="#1d4ed8" />
+            </linearGradient>
+        </defs>
+        <rect width="22" height="22" x="1" y="1" rx="6" fill="url(#bg)"/>
+        <path d="M7 10V7h3M14 7h3v3M17 14v3h-3M10 17H7v-3" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="12" cy="12" r="2.2" fill="#ffffff"/>
+    </svg>
+    """
+    renderer = QSvgRenderer()
+    renderer.load(svg_str.encode("utf-8"))
+    render_size = max(size * 4, 96)
+    pixmap = QPixmap(render_size, render_size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
+
 class Config:
     def __init__(self):
         self.data = {
             "last_save_dir": str(Path.home() / "Pictures"),
             "enable_sound": True,
             "auto_copy": True,
+            "show_magnifier": True,
+            "auto_detect_window": True,
             "pen_width": 3,
             "default_color": "#ea4335",
             "custom_color": "#8ab4f8",
+            "hotkey": "Ctrl+Alt+A",
         }
         self.load()
 
@@ -162,6 +214,70 @@ class Config:
         self.save()
 
 _config = Config()
+
+def _parse_hotkey(hk_str: str) -> tuple[int, int]:
+    hk_str = hk_str.split(',')[0].strip().upper().replace(' ', '')
+    modifiers = 0
+    vk = 0
+    if "CTRL" in hk_str: modifiers |= 0x0002
+    if "ALT" in hk_str: modifiers |= 0x0001
+    if "SHIFT" in hk_str: modifiers |= 0x0004
+    if "WIN" in hk_str or "META" in hk_str: modifiers |= 0x0008
+    
+    parts = hk_str.split('+')
+    if not parts:
+        return 0, 0
+    last_part = parts[-1]
+    
+    if len(last_part) == 1:
+        vk = ord(last_part)
+    elif last_part.startswith('F') and last_part[1:].isdigit():
+        num = int(last_part[1:])
+        if 1 <= num <= 24:
+            vk = 0x6F + num
+    return modifiers, vk
+
+def check_hotkey_conflict_win(hk_str: str) -> tuple[bool, str]:
+    if os.name != "nt":
+        return True, ""
+    modifiers, vk = _parse_hotkey(hk_str)
+    if vk == 0:
+        return False, "无效或不受支持的快捷键组合，请包含字母或功能键。"
+    user32 = ctypes.windll.user32
+    test_id = 0x1337
+    if user32.RegisterHotKey(None, test_id, modifiers, vk):
+        user32.UnregisterHotKey(None, test_id)
+        return True, ""
+    return False, f"快捷键组合 {hk_str} 已被占用，请尝试其他组合。"
+
+def check_autostart_win() -> bool:
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+        val, _ = winreg.QueryValueEx(key, __app_name__)
+        winreg.CloseKey(key)
+        return val == sys.argv[0]
+    except Exception:
+        return False
+
+def set_autostart_win(enable: bool):
+    if os.name != "nt":
+        return
+    import winreg
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+        if enable:
+            winreg.SetValueEx(key, __app_name__, 0, winreg.REG_SZ, sys.argv[0])
+        else:
+            try:
+                winreg.DeleteValue(key, __app_name__)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        logger.error(f"Failed to set autostart: {e}")
 
 def play_shutter_sound():
     if not _config.get("enable_sound", True):
@@ -193,8 +309,7 @@ if os.name == "nt":
     class RECT(ctypes.Structure):
         _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
-    def get_window_rects(virtual_top_left: QPoint) -> list[QRect]:
-        """Detect top-level non-cloaked visible windows in global virtual coordinate space."""
+    def get_window_rects(virtual_top_left: QPoint, dpr: float) -> list[QRect]:
         rects = []
         user32 = ctypes.windll.user32
         dwmapi = ctypes.windll.dwmapi
@@ -211,22 +326,22 @@ if os.name == "nt":
 
             rect = RECT()
             if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                w = rect.right - rect.left
-                h = rect.bottom - rect.top
+                rx = int(rect.left / dpr) - virtual_top_left.x()
+                ry = int(rect.top / dpr) - virtual_top_left.y()
+                w = int((rect.right - rect.left) / dpr)
+                h = int((rect.bottom - rect.top) / dpr)
                 if w > 80 and h > 80:
-                    rx = rect.left - virtual_top_left.x()
-                    ry = rect.top - virtual_top_left.y()
                     rects.append(QRect(rx, ry, w, h))
             return True
 
         try:
             EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
             user32.EnumWindows(EnumWindowsProc(callback), 0)
-        except Exception as e:
-            logger.warning(f"Failed to enumerate windows: {e}")
+        except Exception:
+            pass
         return rects
 else:
-    def get_window_rects(virtual_top_left: QPoint) -> list[QRect]:
+    def get_window_rects(virtual_top_left: QPoint, dpr: float) -> list[QRect]:
         return []
 
 class DrawItem:
@@ -346,13 +461,23 @@ class MosaicItem(DrawItem):
             return
         r = self.rect.toRect()
         if r != self._cached_rect or self._cached_pixmap is None:
-            cropped = base_pixmap.copy(r)
+            dpr = base_pixmap.devicePixelRatio()
+            phys_rect = QRect(int(r.x() * dpr), int(r.y() * dpr), int(r.width() * dpr), int(r.height() * dpr))
+            cropped = base_pixmap.copy(phys_rect)
+            
             if not cropped.isNull():
-                sw = max(1, r.width() // self.block_size)
-                sh = max(1, r.height() // self.block_size)
+                sw = max(1, phys_rect.width() // self.block_size)
+                sh = max(1, phys_rect.height() // self.block_size)
+                
+                cropped.setDevicePixelRatio(1.0)
+                
                 scaled_down = cropped.scaled(sw, sh, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
-                self._cached_pixmap = scaled_down.scaled(r.width(), r.height(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
+                scaled_up = scaled_down.scaled(phys_rect.width(), phys_rect.height(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
+                
+                scaled_up.setDevicePixelRatio(dpr)
+                self._cached_pixmap = scaled_up
                 self._cached_rect = r
+                
         if self._cached_pixmap:
             painter.save()
             painter.drawPixmap(r.topLeft(), self._cached_pixmap)
@@ -367,7 +492,9 @@ class PinnedImageWidget(QWidget):
         self.scale_factor = 1.0
         self.opacity = 1.0
         self.drag_pos = QPoint()
-        self.setFixedSize(pixmap.size())
+        
+        dpr = pixmap.devicePixelRatio()
+        self.setFixedSize(int(pixmap.width() / dpr), int(pixmap.height() / dpr))
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def paintEvent(self, event):
@@ -402,7 +529,8 @@ class PinnedImageWidget(QWidget):
 
     def _reset_scale(self):
         self.scale_factor = 1.0
-        self.setFixedSize(self.original_pixmap.size())
+        dpr = self.original_pixmap.devicePixelRatio()
+        self.setFixedSize(int(self.original_pixmap.width() / dpr), int(self.original_pixmap.height() / dpr))
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton:
@@ -418,8 +546,11 @@ class PinnedImageWidget(QWidget):
             self.update()
         else:
             self.scale_factor = max(0.15, min(5.0, self.scale_factor * (1.1 if delta > 0 else 0.9)))
-            new_w = max(30, int(self.original_pixmap.width() * self.scale_factor))
-            new_h = max(30, int(self.original_pixmap.height() * self.scale_factor))
+            dpr = self.original_pixmap.devicePixelRatio()
+            base_w = self.original_pixmap.width() / dpr
+            base_h = self.original_pixmap.height() / dpr
+            new_w = max(30, int(base_w * self.scale_factor))
+            new_h = max(30, int(base_h * self.scale_factor))
             self.setFixedSize(new_w, new_h)
 
     def mouseDoubleClickEvent(self, event):
@@ -439,15 +570,49 @@ class OCRWorker(QThread):
 
     def run(self):
         try:
-            ocr = RapidOCR()
-            if self._is_cancelled:
+            ocr = get_ocr_engine()
+            if self._is_cancelled or not ocr:
                 return
             result, _ = ocr(self.img_bytes)
             if self._is_cancelled:
                 return
             if result:
-                text = "\n".join([res[1] for res in result])
-                self.finished.emit(text, True)
+                lines_data = []
+                for res in result:
+                    box = res[0]
+                    text = res[1]
+                    xs = [p[0] for p in box]
+                    ys = [p[1] for p in box]
+                    lines_data.append({
+                        "text": text,
+                        "x": min(xs),
+                        "y": sum(ys) / 4.0, 
+                        "h": max(ys) - min(ys)
+                    })
+                
+                lines_data.sort(key=lambda item: item["y"])
+                
+                grouped_lines = []
+                current_line = []
+                
+                for item in lines_data:
+                    if not current_line:
+                        current_line.append(item)
+                    else:
+                        avg_y = sum(b["y"] for b in current_line) / len(current_line)
+                        if abs(item["y"] - avg_y) < item["h"] * 0.6:
+                            current_line.append(item)
+                        else:
+                            current_line.sort(key=lambda b: b["x"])
+                            grouped_lines.append(" ".join(b["text"] for b in current_line))
+                            current_line = [item]
+                
+                if current_line:
+                    current_line.sort(key=lambda b: b["x"])
+                    grouped_lines.append(" ".join(b["text"] for b in current_line))
+                    
+                final_text = "\n".join(grouped_lines)
+                self.finished.emit(final_text, True)
             else:
                 self.finished.emit("未识别到文字，请确保选区清晰。", False)
         except Exception as e:
@@ -459,7 +624,7 @@ class OCRWorker(QThread):
 class OCRDialog(QDialog):
     def __init__(self, pixmap: QPixmap, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("QSnap - 文字提取 (OCR)")
+        self.setWindowTitle(f"{__app_name__} - 文字提取 (OCR)")
         self.resize(520, 360)
         self.worker: OCRWorker | None = None
         self.setStyleSheet("""
@@ -484,12 +649,11 @@ class OCRDialog(QDialog):
 
     def _process_ocr(self, pixmap: QPixmap):
         if not HAS_OCR:
-            self.text_edit.setHtml("""
+            self.text_edit.setHtml(f"""
                 <h3 style="color:#ea4335;">未检测到 RapidOCR 识别组件</h3>
-                <p>QSnap 支持完全本地化、隐私安全的轻量 OCR 引擎。</p>
+                <p>{__app_name__} 支持完全本地化、隐私安全的轻量 OCR 引擎。</p>
                 <p>请在终端运行命令安装：</p>
                 <pre style="background:#e8eaed; padding:8px; border-radius:4px; font-family:Consolas;">pip install rapidocr-onnxruntime</pre>
-                <p>安装后重新运行即可使用秒级离线文字识别。</p>
             """)
             self.copy_btn.hide()
             return
@@ -522,7 +686,7 @@ class OCRDialog(QDialog):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.quit()
-            self.worker.wait(500)
+            self.worker.wait(200)
         super().closeEvent(event)
 
 class ShortcutHelpDialog(QDialog):
@@ -540,7 +704,7 @@ class ShortcutHelpDialog(QDialog):
         self.card.setObjectName("HelpCard")
         lay = QVBoxLayout(self.card)
         lay.setSpacing(8)
-        title = QLabel("⌨ QSnap 快捷键指南")
+        title = QLabel(f"⌨ {__app_name__} 快捷键指南")
         title.setObjectName("Title")
         lay.addWidget(title)
         shortcuts = [
@@ -787,8 +951,6 @@ class SnippingOverlay(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
-        self._capture_full_desktop()
-
         self.state = self.STATE_IDLE
         self.active_tool = "none"
         self.current_color = QColor(_config.get("default_color", "#ea4335"))
@@ -805,11 +967,7 @@ class SnippingOverlay(QWidget):
 
         self.draw_items: list[DrawItem] = []
         self.current_drawing_item: DrawItem | None = None
-
         self.highlighted_window = QRect()
-        self.detect_timer = QTimer(self)
-        self.detect_timer.timeout.connect(self._detect_window)
-        self.detect_timer.start(50)
 
         self.toolbar = FloatingToolBar(self)
         self.toolbar.hide()
@@ -819,18 +977,26 @@ class SnippingOverlay(QWidget):
         self.toolbar.action_triggered.connect(self._handle_action)
 
         self.help_dialog: ShortcutHelpDialog | None = None
+        
+        self.max_dpr = 1.0
+        self._capture_full_desktop()
 
     def _capture_full_desktop(self):
-        """Robust multi-monitor virtual screen stitcher handling arbitrary negative offsets."""
+        """完全按照屏幕最大 DPR 分配高分屏显存，避免逻辑压缩导致的锯齿和发糊！"""
         screens = QGuiApplication.screens()
         self.virtual_rect = QRect()
+        self.max_dpr = 1.0
         for s in screens:
             self.virtual_rect = self.virtual_rect.united(s.geometry())
+            self.max_dpr = max(self.max_dpr, s.devicePixelRatio())
 
         self.setGeometry(self.virtual_rect)
-        self.window_rects = get_window_rects(self.virtual_rect.topLeft())
+        self.window_rects = get_window_rects(self.virtual_rect.topLeft(), self.max_dpr)
 
-        self.full_pixmap = QPixmap(self.virtual_rect.size())
+        phys_w = int(self.virtual_rect.width() * self.max_dpr)
+        phys_h = int(self.virtual_rect.height() * self.max_dpr)
+        self.full_pixmap = QPixmap(phys_w, phys_h)
+        self.full_pixmap.setDevicePixelRatio(self.max_dpr)
         self.full_pixmap.fill(Qt.GlobalColor.black)
 
         painter = QPainter(self.full_pixmap)
@@ -843,19 +1009,15 @@ class SnippingOverlay(QWidget):
 
         self.base_image = self.full_pixmap.toImage()
 
-    def _detect_window(self):
-        if self.state != self.STATE_IDLE:
+    def _detect_window(self, pos: QPoint):
+        if not _config.get("auto_detect_window", True):
             return
-        pos = self.current_mouse_pos
         for rect in self.window_rects:
             if rect.contains(pos):
                 if rect != self.highlighted_window:
                     self.highlighted_window = rect
-                    self.update()
                 return
-        if not self.highlighted_window.isEmpty():
-            self.highlighted_window = QRect()
-            self.update()
+        self.highlighted_window = QRect()
 
     def _set_active_tool(self, tool: str):
         self.active_tool = tool
@@ -919,7 +1081,16 @@ class SnippingOverlay(QWidget):
 
     def _render_final_snipped_pixmap(self) -> QPixmap:
         r = self.selected_rect.normalized()
-        cropped = self.full_pixmap.copy(r)
+        
+        phys_rect = QRect(
+            int(r.x() * self.max_dpr),
+            int(r.y() * self.max_dpr),
+            int(r.width() * self.max_dpr),
+            int(r.height() * self.max_dpr)
+        )
+        cropped = self.full_pixmap.copy(phys_rect)
+        cropped.setDevicePixelRatio(self.max_dpr)
+        
         painter = QPainter(cropped)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.translate(-r.topLeft())
@@ -945,7 +1116,7 @@ class SnippingOverlay(QWidget):
     def _save_file_dialog(self):
         last_dir = _config.get("last_save_dir", str(Path.home() / "Pictures"))
         ts = time.strftime("%Y%m%d_%H%M%S")
-        fp, _ = QFileDialog.getSaveFileName(self, "保存截图", str(Path(last_dir) / f"QSnap_{ts}.png"), "PNG (*.png);;JPEG (*.jpg)")
+        fp, _ = QFileDialog.getSaveFileName(self, "保存截图", str(Path(last_dir) / f"{__app_name__}_{ts}.png"), "PNG (*.png);;JPEG (*.jpg)")
         if fp:
             self._render_final_snipped_pixmap().save(fp)
             _config.set("last_save_dir", str(Path(fp).parent))
@@ -1006,9 +1177,10 @@ class SnippingOverlay(QWidget):
         pos = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
             if self.state == self.STATE_SELECTED and self.active_tool == "picker":
+                rx, ry = int(pos.x() * self.max_dpr), int(pos.y() * self.max_dpr)
                 c = self.base_image.pixelColor(
-                    min(max(0, pos.x()), self.base_image.width() - 1),
-                    min(max(0, pos.y()), self.base_image.height() - 1),
+                    min(max(0, rx), self.base_image.width() - 1),
+                    min(max(0, ry), self.base_image.height() - 1),
                 )
                 self.toolbar._set_color(c)
                 QApplication.clipboard().setText(c.name().upper())
@@ -1061,7 +1233,11 @@ class SnippingOverlay(QWidget):
         pos = event.position().toPoint()
         self.current_mouse_pos = pos
 
-        if self.state == self.STATE_SELECTING:
+        if self.state == self.STATE_IDLE:
+            self._detect_window(pos)
+            self.update()
+
+        elif self.state == self.STATE_SELECTING:
             if (pos - self.start_pos).manhattanLength() > 5:
                 self.highlighted_window = QRect()
             new_rect = QRect(self.start_pos, pos).normalized()
@@ -1112,8 +1288,6 @@ class SnippingOverlay(QWidget):
 
         else:
             self._update_cursor(pos)
-            if self.state == self.STATE_IDLE:
-                self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1200,8 +1374,10 @@ class SnippingOverlay(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
         painter.drawPixmap(0, 0, self.full_pixmap)
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         if self.state == self.STATE_IDLE and not self.highlighted_window.isEmpty():
             painter.setPen(QPen(QColor("#1a73e8"), 2.5, Qt.PenStyle.DashLine))
@@ -1252,13 +1428,14 @@ class SnippingOverlay(QWidget):
             self.current_drawing_item.paint(painter, self.full_pixmap)
         painter.restore()
 
-        if self.state in (self.STATE_IDLE, self.STATE_SELECTING) or self.active_tool == "picker":
+        if _config.get("show_magnifier", True) and (self.state in (self.STATE_IDLE, self.STATE_SELECTING) or self.active_tool == "picker"):
             self._paint_magnifier(painter, self.current_mouse_pos)
 
     def _paint_magnifier(self, painter: QPainter, pos: QPoint):
         x, y = pos.x(), pos.y()
+        rx, ry = int(x * self.max_dpr), int(y * self.max_dpr)
         img_w, img_h = self.base_image.width(), self.base_image.height()
-        rgb = self.base_image.pixelColor(min(max(0, x), img_w - 1), min(max(0, y), img_h - 1))
+        rgb = self.base_image.pixelColor(min(max(0, rx), img_w - 1), min(max(0, ry), img_h - 1))
 
         hud_w, hud_h = 136, 154
         hud_x = x + 20 if x + hud_w + 30 < self.width() else x - hud_w - 20
@@ -1273,8 +1450,8 @@ class SnippingOverlay(QWidget):
         half = 5
         for gx in range(11):
             for gy in range(11):
-                px = min(max(0, x - half + gx), img_w - 1)
-                py = min(max(0, y - half + gy), img_h - 1)
+                px = min(max(0, rx - half + gx), img_w - 1)
+                py = min(max(0, ry - half + gy), img_h - 1)
                 painter.fillRect(hud_x + gx * 10, hud_y + gy * 7, 10, 7, QBrush(self.base_image.pixelColor(px, py)))
 
         painter.setPen(QPen(QColor("#1a73e8"), 2))
@@ -1332,17 +1509,18 @@ class SnippingOverlay(QWidget):
             self.toolbar._on_width_changed(5)
 
     def closeEvent(self, event):
-        if hasattr(self, "detect_timer") and self.detect_timer.isActive():
-            self.detect_timer.stop()
         if self.help_dialog:
             self.help_dialog.close()
+        self.full_pixmap = None
+        self.base_image = None
         super().closeEvent(event)
 
 class GlobalHotkeyThread(QThread):
     hotkey_triggered = Signal()
 
-    def __init__(self, key_id=101):
+    def __init__(self, hotkey_str="Ctrl+Alt+A", key_id=101):
         super().__init__()
+        self.hotkey_str = hotkey_str
         self.key_id = key_id
         self._running = True
 
@@ -1350,12 +1528,14 @@ class GlobalHotkeyThread(QThread):
         if os.name != "nt":
             return
         user32 = ctypes.windll.user32
-        if not user32.RegisterHotKey(None, self.key_id, 0x0001 | 0x0002, 0x41):
-            logger.warning("Global Hotkey Ctrl+Alt+A failed to register (may already be occupied).")
+        modifiers, vk = _parse_hotkey(self.hotkey_str)
+        if not user32.RegisterHotKey(None, self.key_id, modifiers | 0x4000, vk):
+            logger.warning(f"Global Hotkey {self.hotkey_str} failed to register (may already be occupied).")
+            
         msg = wintypes.MSG()
         while self._running:
             if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                if msg.message == 0x0312:
+                if msg.message == 0x0312 and msg.wParam == self.key_id:
                     self.hotkey_triggered.emit()
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
@@ -1365,49 +1545,140 @@ class GlobalHotkeyThread(QThread):
     def stop(self):
         self._running = False
 
+
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, controller=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("QSnap 设置")
-        self.setMinimumSize(480, 320)
+        self.controller = controller
+        self.setWindowTitle(f"{__app_name__} 设置")
+        self.setMinimumSize(540, 580)
         self.setStyleSheet("""
             QDialog { background-color: #f8fafc; }
             QLabel { color: #1e293b; font-size: 13px; }
-            QLabel#SectionTitle { font-size: 14px; font-weight: bold; color: #1a73e8; }
-            QFrame#Card { background: #ffffff; border: 1px solid #e8eaed; border-radius: 8px; padding: 14px; margin: 4px; }
+            QLabel#SectionTitle { font-size: 14px; font-weight: bold; color: #1a73e8; margin-bottom: 2px; }
+            QFrame#Card { background: #ffffff; border: 1px solid #e8eaed; border-radius: 8px; padding: 14px; margin-bottom: 6px; }
             QPushButton { background: #1a73e8; color: #ffffff; border-radius: 6px; padding: 8px 18px; font-weight: bold; border: none; }
             QPushButton:hover { background: #1557b0; }
-            QCheckBox { font-size: 13px; color: #3c4043; padding: 4px; }
+            QPushButton#OutlineBtn { background: transparent; color: #1e293b; border: 1px solid #dadce0; }
+            QPushButton#OutlineBtn:hover { background: #f1f3f4; }
+            QCheckBox { font-size: 13px; color: #3c4043; padding: 2px 0px; }
+            QKeySequenceEdit { border: 1px solid #dadce0; border-radius: 6px; padding: 6px; background: #f1f3f4; font-weight: bold;}
+            QKeySequenceEdit:focus { border: 1px solid #1a73e8; background: #ffffff; }
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { width: 8px; background: transparent; }
+            QScrollBar::handle:vertical { background: #cbd5e1; border-radius: 4px; }
         """)
-        lay = QVBoxLayout(self)
-        lay.setSpacing(12)
-        lay.setContentsMargins(20, 20, 20, 20)
+        
+        main_lay = QVBoxLayout(self)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(content_widget)
+        lay.setSpacing(10)
+        lay.setContentsMargins(20, 20, 20, 10)
 
         card1 = QFrame(objectName="Card")
         c1_lay = QVBoxLayout(card1)
-        c1_lay.addWidget(QLabel("🔊 交互与反馈", objectName="SectionTitle"))
-        chk_sound = QCheckBox("启用快门音效", checked=_config.get("enable_sound", True))
-        chk_sound.toggled.connect(lambda x: _config.set("enable_sound", x))
-        c1_lay.addWidget(chk_sound)
-        chk_copy = QCheckBox("截图完成后自动写入系统剪贴板", checked=_config.get("auto_copy", True))
-        chk_copy.toggled.connect(lambda x: _config.set("auto_copy", x))
-        c1_lay.addWidget(chk_copy)
+        c1_lay.addWidget(QLabel("💻 基础行为", objectName="SectionTitle"))
+        
+        self.chk_autostart = QCheckBox("随系统开机自动启动")
+        if os.name != "nt": self.chk_autostart.setEnabled(False)
+        else: self.chk_autostart.setChecked(check_autostart_win())
+        c1_lay.addWidget(self.chk_autostart)
+
+        self.chk_window = QCheckBox("开启智能窗口吸附检测 (红蓝闪烁框)", checked=_config.get("auto_detect_window", True))
+        c1_lay.addWidget(self.chk_window)
+
+        self.chk_mag = QCheckBox("显示鼠标放大镜吸管辅助", checked=_config.get("show_magnifier", True))
+        c1_lay.addWidget(self.chk_mag)
         lay.addWidget(card1)
 
         card2 = QFrame(objectName="Card")
         c2_lay = QVBoxLayout(card2)
-        c2_lay.addWidget(QLabel("⌨ 热键说明", objectName="SectionTitle"))
-        c2_lay.addWidget(QLabel("全局唤醒热键:  Ctrl + Alt + A", styleSheet="color: #5f6368;"))
-        c2_lay.addWidget(QLabel("在截图界面按 F1 可随时调出全键盘操作指引", styleSheet="color: #5f6368;"))
+        c2_lay.addWidget(QLabel("💾 输出与反馈", objectName="SectionTitle"))
+        
+        self.chk_sound = QCheckBox("启用照相机快门音效", checked=_config.get("enable_sound", True))
+        c2_lay.addWidget(self.chk_sound)
+        
+        self.chk_copy = QCheckBox("截图完成后自动复制到系统剪贴板", checked=_config.get("auto_copy", True))
+        c2_lay.addWidget(self.chk_copy)
+
+        path_lay = QHBoxLayout()
+        path_lay.addWidget(QLabel("默认保存路径:"))
+        self.lbl_path = QLabel(_config.get("last_save_dir", str(Path.home() / "Pictures")))
+        self.lbl_path.setStyleSheet("color: #5f6368;")
+        path_lay.addWidget(self.lbl_path, 1)
+        btn_browse = QPushButton("更改", objectName="OutlineBtn")
+        btn_browse.clicked.connect(self._browse_dir)
+        path_lay.addWidget(btn_browse)
+        c2_lay.addLayout(path_lay)
         lay.addWidget(card2)
 
+        card3 = QFrame(objectName="Card")
+        c3_lay = QVBoxLayout(card3)
+        c3_lay.addWidget(QLabel("⌨ 快捷键", objectName="SectionTitle"))
+        hk_lay = QHBoxLayout()
+        hk_lay.addWidget(QLabel("全局截图热键:"))
+        self.hk_edit = QKeySequenceEdit()
+        self.hk_edit.setKeySequence(QKeySequence(_config.get("hotkey", "Ctrl+Alt+A")))
+        hk_lay.addWidget(self.hk_edit)
+        hk_lay.addStretch()
+        c3_lay.addLayout(hk_lay)
+        c3_lay.addWidget(QLabel("提示：在截图界面按 F1 可随时查看全键盘操作指引。", styleSheet="color: #9aa0a6; margin-top: 4px;"))
+        lay.addWidget(card3)
+
         lay.addStretch()
+        scroll.setWidget(content_widget)
+        main_lay.addWidget(scroll)
+
         btn_lay = QHBoxLayout()
+        btn_lay.setContentsMargins(20, 0, 20, 16)
+        btn_lay.addWidget(QLabel(f"v{__version__} by {__author__}", styleSheet="color: #9aa0a6; font-size: 12px; font-weight: bold;"))
         btn_lay.addStretch()
-        btn_ok = QPushButton("完成")
+        btn_cancel = QPushButton("取消", objectName="OutlineBtn")
+        btn_cancel.clicked.connect(self.reject)
+        btn_lay.addWidget(btn_cancel)
+        btn_ok = QPushButton("保存设置")
         btn_ok.clicked.connect(self.accept)
         btn_lay.addWidget(btn_ok)
-        lay.addLayout(btn_lay)
+        main_lay.addLayout(btn_lay)
+
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.lbl_path.text())
+        if d: self.lbl_path.setText(d)
+
+    def accept(self):
+        new_hk = self.hk_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
+        if not new_hk:
+            QMessageBox.warning(self, "提示", "截图热键不能为空！")
+            return
+            
+        old_hk = _config.get("hotkey", "Ctrl+Alt+A")
+        if new_hk != old_hk:
+            if os.name == "nt":
+                ok, msg = check_hotkey_conflict_win(new_hk)
+                if not ok:
+                    QMessageBox.warning(self, "快捷键冲突", msg)
+                    self.hk_edit.setKeySequence(QKeySequence(old_hk))
+                    return
+            _config.set("hotkey", new_hk)
+            if self.controller:
+                self.controller.update_hotkey(new_hk)
+
+        _config.set("auto_detect_window", self.chk_window.isChecked())
+        _config.set("show_magnifier", self.chk_mag.isChecked())
+        _config.set("enable_sound", self.chk_sound.isChecked())
+        _config.set("auto_copy", self.chk_copy.isChecked())
+        _config.set("last_save_dir", self.lbl_path.text())
+        
+        if os.name == "nt":
+            set_autostart_win(self.chk_autostart.isChecked())
+            
+        super().accept()
+
 
 class QSnapController(QObject):
     def __init__(self):
@@ -1418,30 +1689,53 @@ class QSnapController(QObject):
         self._init_hotkey()
 
     def _init_tray(self):
-        self.tray = QSystemTrayIcon(get_svg_icon("rect", "#1a73e8", 24))
-        self.tray.setToolTip("QSnap - 智能截图与文字识别 (Ctrl+Alt+A)")
+        self.tray = QSystemTrayIcon(get_logo_icon(24))
         menu = QMenu()
         menu.setStyleSheet("""
             QMenu { background: #ffffff; border: 1px solid #e8eaed; border-radius: 8px; padding: 6px; }
             QMenu::item { padding: 8px 24px; font-weight: 500; border-radius: 4px; color: #3c4043; }
             QMenu::item:selected { background: #e8f0fe; color: #1a73e8; }
         """)
-        menu.addAction(get_svg_icon("rect", "#1a73e8", 16), "开始截图 (Ctrl+Alt+A)").triggered.connect(self.trigger_snip)
-        menu.addAction(get_svg_icon("settings", "#5f6368", 16), "设置").triggered.connect(lambda: SettingsDialog().exec())
+        self.snip_action = menu.addAction(get_svg_icon("aspect_ratio", "#1a73e8", 16), "开始截图")
+        self.snip_action.triggered.connect(self.trigger_snip)
+        self._update_tray_ui_texts()
+        
+        menu.addAction(get_svg_icon("settings", "#5f6368", 16), "设置").triggered.connect(lambda: SettingsDialog(self).exec())
         menu.addSeparator()
-        menu.addAction(get_svg_icon("close", "#ea4335", 16), "退出 QSnap").triggered.connect(QApplication.quit)
+        menu.addAction(get_svg_icon("close", "#ea4335", 16), f"退出 {__app_name__}").triggered.connect(QApplication.quit)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda r: self.trigger_snip() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
 
+    def _update_tray_ui_texts(self):
+        hk = _config.get("hotkey", "Ctrl+Alt+A")
+        self.tray.setToolTip(f"{__app_name__} - 智能截图与文字识别 ({hk})")
+        self.snip_action.setText(f"开始截图 ({hk})")
+
     def _init_hotkey(self):
-        self.hotkey_thread = GlobalHotkeyThread()
+        hk = _config.get("hotkey", "Ctrl+Alt+A")
+        self.hotkey_thread = GlobalHotkeyThread(hk)
         self.hotkey_thread.hotkey_triggered.connect(self.trigger_snip)
         self.hotkey_thread.start()
 
+    def update_hotkey(self, new_hk: str):
+        if hasattr(self, "hotkey_thread") and self.hotkey_thread.isRunning():
+            self.hotkey_thread.stop()
+            self.hotkey_thread.quit()
+            self.hotkey_thread.wait(1000)
+            
+        self.hotkey_thread = GlobalHotkeyThread(new_hk)
+        self.hotkey_thread.hotkey_triggered.connect(self.trigger_snip)
+        self.hotkey_thread.start()
+        self._update_tray_ui_texts()
+
     def trigger_snip(self):
-        if self.current_overlay and self.current_overlay.isVisible():
-            return
+        try:
+            if self.current_overlay and self.current_overlay.isVisible():
+                return
+        except RuntimeError:
+            self.current_overlay = None
+
         self.current_overlay = SnippingOverlay(self)
         self.current_overlay.show()
 
@@ -1455,11 +1749,17 @@ class QSnapController(QObject):
             self.hotkey_thread.quit()
             self.hotkey_thread.wait(1000)
 
+
 def main():
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 9))
+    
+    app.setWindowIcon(get_logo_icon(64))
+    
     controller = QSnapController()
     app.aboutToQuit.connect(controller.shutdown)
     sys.exit(app.exec())

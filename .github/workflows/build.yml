@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '手动构建版本号 (例如: 1.0.0)'
+        description: '手动构建版本号 (例如: 1.1.0)'
         required: true
-        default: '1.0.0'
+        default: '1.1.0'
 
 jobs:
   build-and-release:
@@ -28,27 +28,36 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          # 已移除强制 cache: 'pip'，避免找不到 requirements.txt 时报错中断
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           
-          # 优先使用 requirements.txt，若不存在则自动兜底安装
+          # 优先使用 requirements.txt
           if (Test-Path "requirements.txt") {
               Write-Host "检测到 requirements.txt，正在安装依赖..."
               pip install -r requirements.txt
           } else {
-              Write-Host "未找到 requirements.txt，正在使用内置依赖列表安装..."
+              Write-Host "未找到 requirements.txt，使用内置依赖列表安装..."
               pip install PySide6 rapidocr-onnxruntime
           }
           
-          # 安装打包工具
+          # 安装 Nuitka 及极致压缩插件
           pip install nuitka ordered-set zstandard
 
-      - name: Resolve Version
-        id: version
+      - name: Convert SVG to ICO (ImageMagick)
+        shell: pwsh
+        run: |
+          if (Test-Path "icon.svg") {
+            Write-Host "发现 icon.svg，正在生成多分辨率 icon.ico ..."
+            magick.exe -background none icon.svg -define icon:auto-resize=256,128,64,48,32,16 icon.ico
+          } else {
+            Write-Host "未找到 icon.svg，跳过图标生成。"
+          }
+
+      - name: Resolve Target Version
+        id: resolve_version
         shell: bash
         run: |
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
@@ -61,6 +70,7 @@ jobs:
           
           CLEAN_VER=$(echo "$ORIGINAL_VER" | sed -E 's/^[vV]//g')
           
+          # 确保格式为 X.Y.Z 供 Windows 版本号识别
           METADATA_VER=$(echo "$CLEAN_VER" | cut -d'-' -f1)
           if [[ ! "$METADATA_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
             METADATA_VER="1.0.0"
@@ -69,52 +79,56 @@ jobs:
           echo "clean_version=$CLEAN_VER" >> $GITHUB_OUTPUT
           echo "metadata_version=$METADATA_VER" >> $GITHUB_OUTPUT
 
-      - name: Sync Version to Code
+      - name: Sync & Extract Metadata from Code
+        id: meta
         shell: python
         run: |
           import re
           import os
 
-          version = "${{ steps.version.outputs.clean_version }}"
-          print(f"Target version to sync: {version}")
+          version = "${{ steps.resolve_version.outputs.clean_version }}"
+          filename = "main.py"
+          
+          if not os.path.exists(filename):
+              print(f"Error: {filename} not found!")
+              exit(1)
+              
+          with open(filename, 'r', encoding='utf-8') as f:
+              content = f.read()
+          
+          # 同步版本号到代码中
+          content = re.sub(
+              r'(__version__\s*=\s*["\'])[^"\']+(["\'])',
+              f'\\g<1>{version}\\g<2>',
+              content,
+              count=1
+          )
+          with open(filename, 'w', encoding='utf-8') as f:
+              f.write(content)
+              
+          # 提取所有元数据
+          metadata = {}
+          for key in ["__app_name__", "__version__", "__author__", "__company__", "__description__"]:
+              match = re.search(fr'{key}\s*=\s*["\']([^"\']+)["\']', content)
+              metadata[key.strip("_")] = match.group(1) if match else ("QSnap" if key=="__app_name__" else "OpenSource")
+          
+          # 写入 GitHub Actions Output
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              for k, v in metadata.items():
+                  fh.write(f"{k}={v}\n")
+          
+          print(f"Extracted Metadata: {metadata}")
 
-          for filename in ["main.py", "qsnap.py", "QSnap.py"]:
-              if os.path.exists(filename):
-                  with open(filename, 'r', encoding='utf-8') as f:
-                      content = f.read()
-                  
-                  if "__version__" in content:
-                      content = re.sub(
-                          r'(__version__\s*=\s*["\'])[^"\']+(["\'])',
-                          f'\\g<1>{version}\\g<2>',
-                          content,
-                          count=1
-                      )
-                  content = re.sub(
-                      r'QSnap\s+[0-9]+\.[0-9]+(\.[0-9]+)?',
-                      f'QSnap {version}',
-                      content
-                  )
-                  with open(filename, 'w', encoding='utf-8') as f:
-                      f.write(content)
-                  print(f"Successfully synchronized version in {filename}.")
-
-      - name: Build with Nuitka
+      - name: Build with Nuitka (Ultra Optimized)
         shell: pwsh
         run: |
-          $version = "${{ steps.version.outputs.clean_version }}"
-          $metadataVersion = "${{ steps.version.outputs.metadata_version }}"
+          $appName = "${{ steps.meta.outputs.app_name }}"
+          $company = "${{ steps.meta.outputs.company }}"
+          $author = "${{ steps.meta.outputs.author }}"
+          $desc = "${{ steps.meta.outputs.description }}"
           
-          if (Test-Path "main.py") {
-              $entryPoint = "main.py"
-              $expectedExe = "dist/main.exe"
-          } elseif (Test-Path "QSnap.py") {
-              $entryPoint = "QSnap.py"
-              $expectedExe = "dist/QSnap.exe"
-          } else {
-              Write-Error "未在仓库根目录下找到入口文件 (main.py 或 QSnap.py)"
-              exit 1
-          }
+          $version = "${{ steps.meta.outputs.version }}"
+          $metadataVersion = "${{ steps.resolve_version.outputs.metadata_version }}"
           
           $nuitkaParams = @(
             "-m", "nuitka",
@@ -122,19 +136,42 @@ jobs:
             "--onefile",
             "--windows-console-mode=disable",
             "--enable-plugin=pyside6",
-            "--product-name=QSnap",
+            "--enable-plugin=anti-bloat",
+            "--lto=yes",                           
+            "--noinclude-qt-translations",          # <-- 修复点：去掉 =True 
+            
+            # 暴力剔除 PySide6 冗余组件
+            "--nofollow-import-to=PySide6.QtWebEngine",
+            "--nofollow-import-to=PySide6.QtWebEngineCore",
+            "--nofollow-import-to=PySide6.QtWebEngineWidgets",
+            "--nofollow-import-to=PySide6.QtNetwork",
+            "--nofollow-import-to=PySide6.QtQml",
+            "--nofollow-import-to=PySide6.QtQuick",
+            "--nofollow-import-to=PySide6.QtSql",
+            "--nofollow-import-to=PySide6.QtTest",
+            "--nofollow-import-to=PySide6.Qt3DCore",
+            "--nofollow-import-to=PySide6.QtBluetooth",
+            "--nofollow-import-to=PySide6.QtSensors",
+            "--nofollow-import-to=matplotlib",
+            "--nofollow-import-to=pandas",
+            "--nofollow-import-to=scipy",
+            "--nofollow-import-to=tkinter",
+            
+            # 注入 EXE 元数据信息
+            "--company-name=$company",
+            "--product-name=$appName",
+            "--file-description=$desc",
+            "--copyright=Copyright (C) $author All Rights Reserved.",
             "--product-version=$metadataVersion",
-            "--file-description=QSnap Screenshot Suite with OCR",
+            "--file-version=$metadataVersion",
+            
             "--output-dir=dist",
             "--clean-cache=all",
             "--remove-output",
-            "--noinclude-unittest-mode=nofollow",
-            "--noinclude-pytest-mode=nofollow",
-            "--noinclude-setuptools-mode=nofollow",
             "--assume-yes-for-downloads"
           )
           
-          # 针对 RapidOCR 的内置模型与配置做完整打包内嵌
+          # 内嵌 OCR 模型
           $pipList = pip list
           if ($pipList -match "rapidocr_onnxruntime") {
               $nuitkaParams += "--include-package=rapidocr_onnxruntime"
@@ -143,21 +180,21 @@ jobs:
           
           if (Test-Path "icon.ico") {
             $nuitkaParams += "--windows-icon-from-ico=icon.ico"
-            $nuitkaParams += "--include-data-files=icon.ico=icon.ico"
           }
           
-          $nuitkaParams += $entryPoint
+          $nuitkaParams += "main.py"
           
-          Write-Host "开始执行 Nuitka 编译..."
+          Write-Host "开始执行 Nuitka 编译，这可能需要几分钟时间..."
           python @nuitkaParams
           
+          $expectedExe = "dist/main.exe"
           if (Test-Path $expectedExe) {
-            $finalExeName = "QSnap_v$version.exe"
+            $finalExeName = "$($appName)_v$version.exe"
             Rename-Item -Path $expectedExe -NewName $finalExeName
             Write-Host "成功生成单文件程序：dist/$finalExeName"
             
-            Compress-Archive -Path "dist/$finalExeName" -DestinationPath "dist/QSnap_v$($version)_Windows_x64.zip"
-            Write-Host "成功生成发布包：dist/QSnap_v$($version)_Windows_x64.zip"
+            Compress-Archive -Path "dist/$finalExeName" -DestinationPath "dist/$($appName)_v$($version)_Windows_x64.zip"
+            Write-Host "成功生成发布包：dist/$($appName)_v$($version)_Windows_x64.zip"
           } else {
             Write-Error "编译失败：未能在 dist 目录下找到 $expectedExe"
             exit 1
@@ -166,10 +203,10 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: QSnap-Windows-x64
+          name: ${{ steps.meta.outputs.app_name }}-Windows-x64
           path: |
-            dist/QSnap_v*.exe
-            dist/QSnap_v*.zip
+            dist/*.exe
+            dist/*.zip
           retention-days: 7
 
       - name: Generate Changelog
@@ -185,23 +222,23 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.clean_version) }}
-          name: QSnap v${{ steps.version.outputs.clean_version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.meta.outputs.version) }}
+          name: ${{ steps.meta.outputs.app_name }} v${{ steps.meta.outputs.version }}
           body: |
-            ## 🚀 What's Changed
+            ## 🚀 最新更新 (What's Changed)
             
             ${{ steps.changelog.outputs.changelog }}
             
             ---
-            ### 📦 资产下载说明
-            - **`QSnap_v${{ steps.version.outputs.clean_version }}_Windows_x64.zip`**: 便携绿色版压缩包（解压即用）。
-            - **`QSnap_v${{ steps.version.outputs.clean_version }}.exe`**: Windows 64位 独立单文件版。
+            ### 📦 下载说明
+            - **`${{ steps.meta.outputs.app_name }}_v${{ steps.meta.outputs.version }}_Windows_x64.zip`**: 便携绿色版压缩包（解压即用）。
+            - **`${{ steps.meta.outputs.app_name }}_v${{ steps.meta.outputs.version }}.exe`**: Windows 64位 独立单文件版。
             
-            *此版本由 GitHub Actions 自动化编译构建。*
+            *此版本由 GitHub Actions (Nuitka C-Engine) 自动化构建。*
           draft: false
           prerelease: false
           files: |
-            dist/QSnap_v*.exe
-            dist/QSnap_v*.zip
+            dist/*.exe
+            dist/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
