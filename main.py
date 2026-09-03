@@ -1,8 +1,7 @@
-
 from __future__ import annotations
 
 __app_name__ = "QSnap"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __author__ = "QwejayHuang"
 __company__ = "Qwesoft"
 __description__ = "Modern Cross-Platform Python Snipping Tool Powered by RapidOCR"
@@ -90,7 +89,11 @@ from PySide6.QtWidgets import (
 logger = logging.getLogger(__app_name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-_APP_DIR = Path(sys.argv[0]).parent if getattr(sys.argv, 'frozen', False) else Path(__file__).parent
+if getattr(sys, 'frozen', False) or "__compiled__" in globals():
+    _APP_DIR = Path(sys.executable).parent
+else:
+    _APP_DIR = Path(__file__).parent
+
 _PORTABLE_CONFIG = _APP_DIR / "config.json"
 
 if _PORTABLE_CONFIG.exists():
@@ -148,7 +151,6 @@ def get_svg_icon(name: str, color: str = "#475569", size: int = 24) -> QIcon:
     return QIcon(pixmap)
 
 def get_logo_icon(size: int = 24) -> QIcon:
-    """渲染具有大厂风格的现代渐变专属 Logo"""
     svg_str = """
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
         <defs>
@@ -982,7 +984,6 @@ class SnippingOverlay(QWidget):
         self._capture_full_desktop()
 
     def _capture_full_desktop(self):
-        """完全按照屏幕最大 DPR 分配高分屏显存，避免逻辑压缩导致的锯齿和发糊！"""
         screens = QGuiApplication.screens()
         self.virtual_rect = QRect()
         self.max_dpr = 1.0

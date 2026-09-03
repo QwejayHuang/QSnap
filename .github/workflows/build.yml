@@ -34,7 +34,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           
-          # 优先使用 requirements.txt
           if (Test-Path "requirements.txt") {
               Write-Host "检测到 requirements.txt，正在安装依赖..."
               pip install -r requirements.txt
@@ -43,7 +42,6 @@ jobs:
               pip install PySide6 rapidocr-onnxruntime
           }
           
-          # 安装 Nuitka 及极致压缩插件
           pip install nuitka ordered-set zstandard
 
       - name: Convert SVG to ICO (ImageMagick)
@@ -70,7 +68,6 @@ jobs:
           
           CLEAN_VER=$(echo "$ORIGINAL_VER" | sed -E 's/^[vV]//g')
           
-          # 确保格式为 X.Y.Z 供 Windows 版本号识别
           METADATA_VER=$(echo "$CLEAN_VER" | cut -d'-' -f1)
           if [[ ! "$METADATA_VER" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
             METADATA_VER="1.0.0"
@@ -96,7 +93,6 @@ jobs:
           with open(filename, 'r', encoding='utf-8') as f:
               content = f.read()
           
-          # 同步版本号到代码中
           content = re.sub(
               r'(__version__\s*=\s*["\'])[^"\']+(["\'])',
               f'\\g<1>{version}\\g<2>',
@@ -106,99 +102,115 @@ jobs:
           with open(filename, 'w', encoding='utf-8') as f:
               f.write(content)
               
-          # 提取所有元数据
           metadata = {}
           for key in ["__app_name__", "__version__", "__author__", "__company__", "__description__"]:
               match = re.search(fr'{key}\s*=\s*["\']([^"\']+)["\']', content)
               metadata[key.strip("_")] = match.group(1) if match else ("QSnap" if key=="__app_name__" else "OpenSource")
           
-          # 写入 GitHub Actions Output
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
               for k, v in metadata.items():
                   fh.write(f"{k}={v}\n")
           
           print(f"Extracted Metadata: {metadata}")
 
-      - name: Build with Nuitka (Ultra Optimized)
-        shell: pwsh
+      - name: Build with Nuitka (Ultra Optimized & Force Data Injection)
+        shell: python
         run: |
-          $appName = "${{ steps.meta.outputs.app_name }}"
-          $company = "${{ steps.meta.outputs.company }}"
-          $author = "${{ steps.meta.outputs.author }}"
-          $desc = "${{ steps.meta.outputs.description }}"
+          import os
+          import sys
+          import subprocess
+          import shutil
+
+          app_name = "${{ steps.meta.outputs.app_name }}"
+          company = "${{ steps.meta.outputs.company }}"
+          author = "${{ steps.meta.outputs.author }}"
+          desc = "${{ steps.meta.outputs.description }}"
+          metadata_version = "${{ steps.resolve_version.outputs.metadata_version }}"
+          version = "${{ steps.meta.outputs.version }}"
+
+          cmd = [
+              sys.executable, "-m", "nuitka",
+              "--standalone",
+              "--onefile",
+              "--windows-console-mode=disable",
+              "--enable-plugin=pyside6",
+              "--enable-plugin=anti-bloat",
+              "--lto=yes",                           
+              "--noinclude-qt-translations",
+              
+              "--nofollow-import-to=PySide6.QtWebEngine",
+              "--nofollow-import-to=PySide6.QtWebEngineCore",
+              "--nofollow-import-to=PySide6.QtWebEngineWidgets",
+              "--nofollow-import-to=PySide6.QtNetwork",
+              "--nofollow-import-to=PySide6.QtQml",
+              "--nofollow-import-to=PySide6.QtQuick",
+              "--nofollow-import-to=PySide6.QtSql",
+              "--nofollow-import-to=PySide6.QtTest",
+              "--nofollow-import-to=PySide6.Qt3DCore",
+              "--nofollow-import-to=PySide6.QtBluetooth",
+              "--nofollow-import-to=PySide6.QtSensors",
+              "--nofollow-import-to=matplotlib",
+              "--nofollow-import-to=pandas",
+              "--nofollow-import-to=scipy",
+              "--nofollow-import-to=tkinter",
+              
+              f"--company-name={company}",
+              f"--product-name={app_name}",
+              f"--file-description={desc}",
+              f"--copyright=Copyright (C) {author} All Rights Reserved.",
+              f"--product-version={metadata_version}",
+              f"--file-version={metadata_version}",
+              
+              "--output-dir=dist",
+              "--clean-cache=all",
+              "--remove-output",
+              "--assume-yes-for-downloads"
+          ]
           
-          $version = "${{ steps.meta.outputs.version }}"
-          $metadataVersion = "${{ steps.resolve_version.outputs.metadata_version }}"
+          try:
+              import rapidocr_onnxruntime
+              ocr_path = os.path.dirname(rapidocr_onnxruntime.__file__)
+              cmd.append(f"--include-data-dir={ocr_path}=rapidocr_onnxruntime")
+              print(f"[Success] Found & Included RapidOCR Data from: {ocr_path}")
+          except ImportError:
+              print("[Warning] rapidocr_onnxruntime not found!")
+
+          try:
+              import onnxruntime
+              onnx_path = os.path.dirname(onnxruntime.__file__)
+              cmd.append(f"--include-data-dir={onnx_path}=onnxruntime")
+              print(f"[Success] Found & Included ONNXRuntime Data from: {onnx_path}")
+          except ImportError:
+              print("[Warning] onnxruntime not found!")
+              
+          if os.path.exists("icon.ico"):
+              cmd.append("--windows-icon-from-ico=icon.ico")
+              
+          cmd.append("main.py")
           
-          $nuitkaParams = @(
-            "-m", "nuitka",
-            "--standalone",
-            "--onefile",
-            "--windows-console-mode=disable",
-            "--enable-plugin=pyside6",
-            "--enable-plugin=anti-bloat",
-            "--lto=yes",                           
-            "--noinclude-qt-translations",          # <-- 修复点：去掉 =True 
-            
-            # 暴力剔除 PySide6 冗余组件
-            "--nofollow-import-to=PySide6.QtWebEngine",
-            "--nofollow-import-to=PySide6.QtWebEngineCore",
-            "--nofollow-import-to=PySide6.QtWebEngineWidgets",
-            "--nofollow-import-to=PySide6.QtNetwork",
-            "--nofollow-import-to=PySide6.QtQml",
-            "--nofollow-import-to=PySide6.QtQuick",
-            "--nofollow-import-to=PySide6.QtSql",
-            "--nofollow-import-to=PySide6.QtTest",
-            "--nofollow-import-to=PySide6.Qt3DCore",
-            "--nofollow-import-to=PySide6.QtBluetooth",
-            "--nofollow-import-to=PySide6.QtSensors",
-            "--nofollow-import-to=matplotlib",
-            "--nofollow-import-to=pandas",
-            "--nofollow-import-to=scipy",
-            "--nofollow-import-to=tkinter",
-            
-            # 注入 EXE 元数据信息
-            "--company-name=$company",
-            "--product-name=$appName",
-            "--file-description=$desc",
-            "--copyright=Copyright (C) $author All Rights Reserved.",
-            "--product-version=$metadataVersion",
-            "--file-version=$metadataVersion",
-            
-            "--output-dir=dist",
-            "--clean-cache=all",
-            "--remove-output",
-            "--assume-yes-for-downloads"
-          )
+          print(f"\n[Executing Command] {' '.join(cmd)}\n")
           
-          # 内嵌 OCR 模型
-          $pipList = pip list
-          if ($pipList -match "rapidocr_onnxruntime") {
-              $nuitkaParams += "--include-package=rapidocr_onnxruntime"
-              $nuitkaParams += "--include-package-data=rapidocr_onnxruntime"
-          }
+          result = subprocess.run(cmd)
+          if result.returncode != 0:
+              print("\n[Error] Nuitka compilation failed!")
+              sys.exit(1)
+              
+          dist_dir = "dist"
+          expected_exe = os.path.join(dist_dir, "main.exe")
           
-          if (Test-Path "icon.ico") {
-            $nuitkaParams += "--windows-icon-from-ico=icon.ico"
-          }
-          
-          $nuitkaParams += "main.py"
-          
-          Write-Host "开始执行 Nuitka 编译，这可能需要几分钟时间..."
-          python @nuitkaParams
-          
-          $expectedExe = "dist/main.exe"
-          if (Test-Path $expectedExe) {
-            $finalExeName = "$($appName)_v$version.exe"
-            Rename-Item -Path $expectedExe -NewName $finalExeName
-            Write-Host "成功生成单文件程序：dist/$finalExeName"
-            
-            Compress-Archive -Path "dist/$finalExeName" -DestinationPath "dist/$($appName)_v$($version)_Windows_x64.zip"
-            Write-Host "成功生成发布包：dist/$($appName)_v$($version)_Windows_x64.zip"
-          } else {
-            Write-Error "编译失败：未能在 dist 目录下找到 $expectedExe"
-            exit 1
-          }
+          if os.path.exists(expected_exe):
+              final_exe_name = f"{app_name}_v{version}.exe"
+              final_exe_path = os.path.join(dist_dir, final_exe_name)
+              os.rename(expected_exe, final_exe_path)
+              print(f"\n[Success] Generated single executable: {final_exe_path}")
+              
+              zip_name = f"{app_name}_v{version}_Windows_x64.zip"
+              zip_path = os.path.join(dist_dir, zip_name)
+              shutil.make_archive(zip_path.replace('.zip', ''), 'zip', dist_dir, final_exe_name)
+              print(f"[Success] Generated release package: {zip_path}")
+          else:
+              print(f"\n[Error] Build failed: Expected {expected_exe} but it was not found!")
+              sys.exit(1)
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
